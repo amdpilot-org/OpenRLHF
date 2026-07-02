@@ -106,37 +106,66 @@ class AMDGRPOTrainer:
     def _sample_responses(
         self, prompt_ids: torch.Tensor, group_size: int
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Sample ``group_size`` responses per prompt.
+        """Sample ``group_size`` responses per prompt using KV cache.
 
         Returns
         -------
         full_ids: ``[P*G, prompt_len + resp_len]``
         old_logprobs: ``[P*G, resp_len]``  (log-prob of each sampled token)
+
+        Optimisation: the prompt is processed once to populate the KV cache;
+        each subsequent decode step feeds only the single new token, avoiding
+        the O(resp_len²) recompute of the naive loop.  The output buffer is
+        pre-allocated (no per-step ``torch.cat``) and ``log_softmax`` is
+        computed once per step (``probs = logp.exp()``) instead of running
+        both ``softmax`` and ``log_softmax``.
         """
         cfg = self.config
         P = prompt_ids.size(0)
         G = group_size
+        PG = P * G
+        resp_len = cfg.response_length
         device = next(self.policy.parameters()).device
 
         # Expand prompts: [P, L] -> [P*G, L]
-        prompts = prompt_ids.unsqueeze(1).expand(P, G, -1).reshape(P * G, -1).to(device)
-        cur = prompts
-        sampled = []
+        prompts = prompt_ids.unsqueeze(1).expand(P, G, -1).reshape(PG, -1).to(device)
+        total_len = cfg.prompt_length + resp_len
+
+        # Pre-allocate the full output buffer (avoids per-step torch.cat).
+        full_ids = torch.zeros(PG, total_len, dtype=prompts.dtype, device=device)
+        full_ids[:, : cfg.prompt_length] = prompts
+
         token_logprobs = []
+        temp = max(cfg.temperature, 1e-6)
 
-        for _ in range(cfg.response_length):
-            out = self.policy(cur)
-            logits = out.logits[:, -1, :] / max(cfg.temperature, 1e-6)
-            probs = torch.softmax(logits, dim=-1)
+        # First forward: process the full prompt, populate KV cache.
+        out = self.policy(prompts, use_cache=True)
+        past_kv = out.past_key_values
+        logits = out.logits[:, -1, :] / temp
+        logp_full = torch.log_softmax(logits, dim=-1)
+        probs = logp_full.exp()
+        next_token = torch.multinomial(probs, num_samples=1).squeeze(-1)
+        token_logprobs.append(
+            logp_full.gather(-1, next_token.unsqueeze(-1)).squeeze(-1)
+        )
+        full_ids[:, cfg.prompt_length] = next_token
+
+        # Subsequent forwards: feed only the new token, reuse KV cache.
+        for i in range(1, resp_len):
+            out = self.policy(
+                next_token.unsqueeze(-1), past_key_values=past_kv, use_cache=True
+            )
+            past_kv = out.past_key_values
+            logits = out.logits[:, -1, :] / temp
+            logp_full = torch.log_softmax(logits, dim=-1)
+            probs = logp_full.exp()
             next_token = torch.multinomial(probs, num_samples=1).squeeze(-1)
-            logp = torch.log_softmax(logits, dim=-1).gather(-1, next_token.unsqueeze(-1)).squeeze(-1)
-            sampled.append(next_token)
-            token_logprobs.append(logp)
-            cur = torch.cat([cur, next_token.unsqueeze(-1)], dim=-1)
+            token_logprobs.append(
+                logp_full.gather(-1, next_token.unsqueeze(-1)).squeeze(-1)
+            )
+            full_ids[:, cfg.prompt_length + i] = next_token
 
-        responses = torch.stack(sampled, dim=1)  # [P*G, resp_len]
         old_logprobs = torch.stack(token_logprobs, dim=1)  # [P*G, resp_len]
-        full_ids = cur  # [P*G, prompt_len + resp_len]
         return full_ids, old_logprobs
 
     # ----------------------------------------------------------------- #

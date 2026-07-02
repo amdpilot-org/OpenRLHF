@@ -217,11 +217,13 @@ class FSDPStrategy:
 
     def get_grad_norm(self, model) -> float:
         # Compute the FSDP-aware total grad norm without clipping.
-        sq = 0.0
+        # Accumulate on GPU and sync once (not per-parameter) to avoid
+        # N separate CPU-GPU synchronisations.
+        sq = torch.zeros(1, device=self.device)
         for p in model.parameters():
             if p.grad is not None:
-                sq += float(p.grad.detach().float().pow(2).sum().item())
-        return sq**0.5
+                sq += p.grad.detach().float().pow(2).sum()
+        return float(sq.item()) ** 0.5
 
     # ------------------------------------------------------------------ #
     # Data loading
