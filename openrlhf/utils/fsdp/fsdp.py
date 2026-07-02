@@ -206,10 +206,21 @@ class FSDPStrategy:
     def backward(self, loss, model, optimizer) -> None:
         loss.backward()
 
-    def optimizer_step(self, optimizer, model, scheduler, name=None) -> None:
+    def optimizer_step(self, optimizer, model, scheduler, name=None, grad_norm=None) -> None:
         if self.max_norm > 0:
-            # FSDP-aware grad norm clipping; returns the pre-clip total norm.
-            torch.nn.utils.clip_grad_norm_(model.parameters(), self.max_norm)
+            if grad_norm is not None and self._world_size == 1:
+                # Use the pre-computed grad norm for clipping, avoiding the
+                # redundant norm computation + CPU-GPU sync inside
+                # ``clip_grad_norm_``.  Only safe for world_size == 1 (local
+                # norm == global norm); multi-GPU falls back to the FSDP-aware
+                # ``clip_grad_norm_`` which all-reduces correctly.
+                clip_coef = self.max_norm / (grad_norm + 1e-6)
+                if clip_coef < 1.0:
+                    for p in model.parameters():
+                        if p.grad is not None:
+                            p.grad.mul_(clip_coef)
+            else:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), self.max_norm)
         optimizer.step()
         if scheduler is not None:
             scheduler.step()

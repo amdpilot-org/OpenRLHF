@@ -231,17 +231,32 @@ class AMDGRPOTrainer:
         # 6. Backward + optimizer step (FSDP-aware).
         self.strategy.backward(loss, self.policy, self.optimizer)
         grad_norm = self.strategy.get_grad_norm(self.policy)
-        self.strategy.optimizer_step(self.optimizer, self.policy, self.scheduler)
+        # Pass the pre-computed grad norm so optimizer_step can clip without
+        # recomputing it (saves one CPU-GPU sync per step).
+        self.strategy.optimizer_step(
+            self.optimizer, self.policy, self.scheduler, grad_norm=grad_norm
+        )
 
         self._step += 1
+        # Batch all scalar metrics into a single CPU transfer (one sync
+        # instead of six separate .item() calls).
+        metrics_stack = torch.stack([
+            loss.detach().reshape(()),
+            policy_loss.detach().reshape(()),
+            kl_loss.detach().reshape(()),
+            rewards.mean(),
+            rewards.std(),
+            advantages.mean(),
+        ])
+        vals = metrics_stack.cpu().tolist()
         return {
-            "loss": float(loss.detach().item()),
-            "policy_loss": float(policy_loss.detach().item()),
-            "kl": float(kl_loss.item()),
+            "loss": vals[0],
+            "policy_loss": vals[1],
+            "kl": vals[2],
             "grad_norm": float(grad_norm),
-            "reward_mean": float(rewards.mean().item()),
-            "reward_std": float(rewards.std().item()),
-            "adv_mean": float(advantages.mean().item()),
+            "reward_mean": vals[3],
+            "reward_std": vals[4],
+            "adv_mean": vals[5],
             "step": self._step,
         }
 
@@ -350,8 +365,12 @@ def run_minimal_grpo_step(
     reward_fn = make_token_count_reward(target_token)
     prompt_ids = torch.randint(2, vocab_size, (num_prompts, prompt_length))
 
-    # Warmup (not timed): one forward to trigger FSDP unshard / kernel JIT.
-    _ = trainer.grpo_step(prompt_ids, reward_fn)
+    # Warmup (not timed): run 3 steps to ensure all AOTriton flash-attn
+    # kernels (forward + backward, prompt-only + full-sequence shapes) are
+    # compiled before timing begins.  A single warmup step is insufficient
+    # because AOTriton lazily compiles different kernel variants on first use.
+    for _ in range(3):
+        _ = trainer.grpo_step(prompt_ids, reward_fn)
 
     metrics: List[Dict[str, float]] = []
     step_times: List[float] = []
