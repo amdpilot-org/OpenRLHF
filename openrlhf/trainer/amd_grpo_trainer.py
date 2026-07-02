@@ -142,11 +142,12 @@ class AMDGRPOTrainer:
         out = self.policy(prompts, use_cache=True)
         past_kv = out.past_key_values
         logits = out.logits[:, -1, :] / temp
-        logp_full = torch.log_softmax(logits, dim=-1)
-        probs = logp_full.exp()
+        # softmax for sampling + cross_entropy for logprob (fused, avoids
+        # materialising a separate log_softmax tensor).
+        probs = torch.softmax(logits, dim=-1)
         next_token = torch.multinomial(probs, num_samples=1).squeeze(-1)
         token_logprobs.append(
-            logp_full.gather(-1, next_token.unsqueeze(-1)).squeeze(-1)
+            -F.cross_entropy(logits, next_token, reduction="none")
         )
         full_ids[:, cfg.prompt_length] = next_token
 
@@ -157,11 +158,10 @@ class AMDGRPOTrainer:
             )
             past_kv = out.past_key_values
             logits = out.logits[:, -1, :] / temp
-            logp_full = torch.log_softmax(logits, dim=-1)
-            probs = logp_full.exp()
+            probs = torch.softmax(logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1).squeeze(-1)
             token_logprobs.append(
-                logp_full.gather(-1, next_token.unsqueeze(-1)).squeeze(-1)
+                -F.cross_entropy(logits, next_token, reduction="none")
             )
             full_ids[:, cfg.prompt_length + i] = next_token
 
@@ -178,8 +178,13 @@ class AMDGRPOTrainer:
         targets = full_ids[:, prompt_len:]  # response tokens
         # align: logits at positions [prompt_len-1 .. end-1] predict response tokens
         resp_logits = logits[:, prompt_len - 1 :, :]
-        logp = torch.log_softmax(resp_logits, dim=-1)
-        token_logp = logp.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
+        # F.cross_entropy computes -log_softmax(logits)[target] in a single
+        # fused kernel — avoids materialising the full [PG, resp_len, V]
+        # log_softmax tensor.
+        PG, RL, V = resp_logits.shape
+        token_logp = -F.cross_entropy(
+            resp_logits.reshape(-1, V), targets.reshape(-1), reduction="none"
+        ).reshape(PG, RL)
         return token_logp  # [P*G, resp_len]
 
     # ----------------------------------------------------------------- #
@@ -321,6 +326,14 @@ def run_minimal_grpo_step(
         torch.cuda.manual_seed_all(seed)
 
     from openrlhf.utils.fsdp import FSDPStrategy
+
+    # ROCm-safe Inductor / Dynamo config (env-probe recommended fixes).
+    # Must be set before any torch.compile() call.
+    import torch._inductor.config as inductor_config
+    import torch._dynamo.config as dynamo_config
+    inductor_config.max_autotune_gemm_backends = "ATEN"  # skip TRITON/CPP autotuning
+    inductor_config.triton.cudagraph_trees = False  # unstable on ROCm
+    dynamo_config.cache_size_limit = 128  # prevent recompilation loops
 
     strategy = FSDPStrategy(
         seed=seed,
