@@ -135,20 +135,26 @@ class AMDGRPOTrainer:
         full_ids = torch.zeros(PG, total_len, dtype=prompts.dtype, device=device)
         full_ids[:, : cfg.prompt_length] = prompts
 
-        token_logprobs = []
         temp = max(cfg.temperature, 1e-6)
+        # Skip the elementwise division kernel when temperature is 1.0
+        # (the default) — saves one kernel launch per decode step.
+        need_scale = temp != 1.0
 
         # First forward: process the full prompt, populate KV cache.
         out = self.policy(prompts, use_cache=True)
         past_kv = out.past_key_values
-        logits = out.logits[:, -1, :] / temp
+        logits = out.logits[:, -1, :]
+        if need_scale:
+            logits = logits / temp
         # softmax for sampling + cross_entropy for logprob (fused, avoids
         # materialising a separate log_softmax tensor).
         probs = torch.softmax(logits, dim=-1)
         next_token = torch.multinomial(probs, num_samples=1).squeeze(-1)
-        token_logprobs.append(
-            -F.cross_entropy(logits, next_token, reduction="none")
-        )
+        step_lp = -F.cross_entropy(logits, next_token, reduction="none")
+        # Pre-allocate the logprob buffer (avoids torch.stack kernel + list
+        # append overhead across resp_len decode steps).
+        old_logprobs = torch.empty(PG, resp_len, dtype=step_lp.dtype, device=device)
+        old_logprobs[:, 0] = step_lp
         full_ids[:, cfg.prompt_length] = next_token
 
         # Subsequent forwards: feed only the new token, reuse KV cache.
@@ -157,15 +163,14 @@ class AMDGRPOTrainer:
                 next_token.unsqueeze(-1), past_key_values=past_kv, use_cache=True
             )
             past_kv = out.past_key_values
-            logits = out.logits[:, -1, :] / temp
+            logits = out.logits[:, -1, :]
+            if need_scale:
+                logits = logits / temp
             probs = torch.softmax(logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1).squeeze(-1)
-            token_logprobs.append(
-                -F.cross_entropy(logits, next_token, reduction="none")
-            )
+            old_logprobs[:, i] = -F.cross_entropy(logits, next_token, reduction="none")
             full_ids[:, cfg.prompt_length + i] = next_token
 
-        old_logprobs = torch.stack(token_logprobs, dim=1)  # [P*G, resp_len]
         return full_ids, old_logprobs
 
     # ----------------------------------------------------------------- #

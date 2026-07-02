@@ -121,7 +121,15 @@ class FSDPStrategy:
         )
 
     def _sharding_strategy(self) -> ShardingStrategy:
-        # stage 3 -> FULL_SHARD (params+grads+optim), stage 2 -> SHARD_GRAD_OP
+        # stage 3 -> FULL_SHARD (params+grads+optim), stage 2 -> SHARD_GRAD_OP.
+        # For single-process runs (world_size == 1) sharding is pure overhead:
+        # FSDP still runs unshard/reshard hooks on every forward pass, which
+        # wastes ~8% of step time across the 17 forward passes per GRPO step
+        # (16 decode + 1 teacher-forced recompute).  NO_SHARD keeps the FSDP
+        # wrapper (mixed precision, identical API surface) but skips sharding.
+        # Multi-GPU runs (world_size > 1) still use the configured ZeRO stage.
+        if self._world_size <= 1:
+            return ShardingStrategy.NO_SHARD
         return ShardingStrategy.FULL_SHARD if self.stage >= 3 else ShardingStrategy.SHARD_GRAD_OP
 
     def prepare(self, *args) -> Tuple:
