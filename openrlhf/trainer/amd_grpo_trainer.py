@@ -116,9 +116,9 @@ class AMDGRPOTrainer:
         Optimisation: the prompt is processed once to populate the KV cache;
         each subsequent decode step feeds only the single new token, avoiding
         the O(resp_len²) recompute of the naive loop.  The output buffer is
-        pre-allocated (no per-step ``torch.cat``) and ``log_softmax`` is
-        computed once per step (``probs = logp.exp()``) instead of running
-        both ``softmax`` and ``log_softmax``.
+        pre-allocated (no per-step ``torch.cat``) and all token logprobs are
+        computed in a single batched ``F.cross_entropy`` call after the loop
+        instead of one call per decode step (saves kernel launches).
         """
         cfg = self.config
         P = prompt_ids.size(0)
@@ -132,7 +132,9 @@ class AMDGRPOTrainer:
         total_len = cfg.prompt_length + resp_len
 
         # Pre-allocate the full output buffer (avoids per-step torch.cat).
-        full_ids = torch.zeros(PG, total_len, dtype=prompts.dtype, device=device)
+        # torch.empty: all positions are written before reading (prompt copy
+        # + per-step token assignment), so no zero-fill kernel needed.
+        full_ids = torch.empty(PG, total_len, dtype=prompts.dtype, device=device)
         full_ids[:, : cfg.prompt_length] = prompts
 
         temp = max(cfg.temperature, 1e-6)
@@ -140,36 +142,47 @@ class AMDGRPOTrainer:
         # (the default) — saves one kernel launch per decode step.
         need_scale = temp != 1.0
 
+        # Cache policy as local to avoid repeated attribute lookup in the
+        # decode loop (16 iterations).
+        policy = self.policy
         # First forward: process the full prompt, populate KV cache.
-        out = self.policy(prompts, use_cache=True)
+        out = policy(prompts, use_cache=True)
         past_kv = out.past_key_values
         logits = out.logits[:, -1, :]
+        V = logits.size(-1)
         if need_scale:
             logits = logits / temp
-        # softmax for sampling + cross_entropy for logprob (fused, avoids
-        # materialising a separate log_softmax tensor).
+        # Pre-allocate logits buffer for batched cross_entropy after the
+        # loop.  Storing logits each step and computing all logprobs in one
+        # fused F.cross_entropy call replaces resp_len individual calls
+        # (each launching 2-3 kernels: log_softmax + gather + neg).
+        all_logits = torch.empty(PG, resp_len, V, dtype=logits.dtype, device=device)
+        all_logits[:, 0] = logits
         probs = torch.softmax(logits, dim=-1)
         next_token = torch.multinomial(probs, num_samples=1).squeeze(-1)
-        step_lp = -F.cross_entropy(logits, next_token, reduction="none")
-        # Pre-allocate the logprob buffer (avoids torch.stack kernel + list
-        # append overhead across resp_len decode steps).
-        old_logprobs = torch.empty(PG, resp_len, dtype=step_lp.dtype, device=device)
-        old_logprobs[:, 0] = step_lp
         full_ids[:, cfg.prompt_length] = next_token
 
         # Subsequent forwards: feed only the new token, reuse KV cache.
         for i in range(1, resp_len):
-            out = self.policy(
+            out = policy(
                 next_token.unsqueeze(-1), past_key_values=past_kv, use_cache=True
             )
             past_kv = out.past_key_values
             logits = out.logits[:, -1, :]
             if need_scale:
                 logits = logits / temp
+            all_logits[:, i] = logits
             probs = torch.softmax(logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1).squeeze(-1)
-            old_logprobs[:, i] = -F.cross_entropy(logits, next_token, reduction="none")
             full_ids[:, cfg.prompt_length + i] = next_token
+
+        # Batched cross_entropy: one fused call replaces resp_len individual
+        # calls, saving (resp_len-1) × 2-3 kernel launches per GRPO step.
+        old_logprobs = -F.cross_entropy(
+            all_logits.reshape(-1, V),
+            full_ids[:, cfg.prompt_length:].reshape(-1),
+            reduction="none",
+        ).reshape(PG, resp_len)
 
         return full_ids, old_logprobs
 
