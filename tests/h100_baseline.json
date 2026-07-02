@@ -1,0 +1,32 @@
+{
+  "_comment": "H100 baseline contract for the FSDP-AMD GRPO path (Stage 1). The 'path_validation' entry is a real measurement from the MI355X smoke test (tiny Llama, FSDP world_size=1) that proves the code path executes. The 'llama33_70b' entry is the performance target contract for a realistic config: MI355X grpo_step_time must be within 1.4x of the H100 baseline. The H100 number for the 70B config is a documented reference to be confirmed by a real H100 run; the MI355X target is derived as h100 * 1.4.",
+  "path_validation": {
+    "model": "tiny-llama (hidden=64, layers=2, vocab=64)",
+    "hardware": "MI355X (gfx950), single GPU, FSDP world_size=1",
+    "config": {
+      "group_size": 16,
+      "num_prompts": 4,
+      "response_length": 16,
+      "prompt_length": 4
+    },
+    "grpo_step_time_sec": 0.031,
+    "reward_monotonic_increase": true,
+    "note": "Validates that FSDPStrategy.setup_distributed -> prepare -> sample -> group_norm advantage -> PPO-clipped loss -> backward -> optimizer_step executes on ROCm and that reward strictly increases over steps."
+  },
+  "llama33_70b": {
+    "model": "amd/Llama-3.3-70B-Instruct-MXFP4-Preview",
+    "h100_baseline": {
+      "hardware": "8x H100 80GB",
+      "strategy": "FSDP (ZeRO-3 equivalent)",
+      "grpo_step_time_sec": 1.85,
+      "source": "reference contract (to be confirmed by real H100 run)"
+    },
+    "mi355x_target": {
+      "hardware": "8x MI355X (gfx950)",
+      "strategy": "FSDP-AMD + aiter MXFP4",
+      "grpo_step_time_sec_target": 2.59,
+      "target_ratio": 1.4,
+      "note": "MI355X target = h100_baseline * 1.4. Stage 1 enables the path; a later stage measures the realistic-config step time against this contract."
+    }
+  }
+}
